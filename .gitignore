@@ -1,0 +1,7 @@
+build/
+venv/
+.vscode/
+partition_table/
+sdkconfig
+sdkconfig.old
+*.log

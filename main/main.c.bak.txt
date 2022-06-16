@@ -1,0 +1,137 @@
+#include <stdio.h>
+#include "apa102pov.h"
+// #include "pov_timer.h"
+#include "esp_err.h"
+#include "tcp_server.h"
+#include "mywifi.h"
+#include "driver/timer.h"
+
+/*
+ * 算了一下, 大概过程是这样:
+ * 晶振40MHz, 10分频, 也就是4MHz, 也就是4000kHz, 也就是4 * 1000 * 1000 Hz, 每秒这么多个时钟周期
+ * 电机是每分钟3500转, 每秒58.33转, 也就是4000/58.33 = 68.575 k个时钟周期转一圈
+ * 所以我这儿设置成68575
+ */
+#define ROT_TIME 68575
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+typedef enum
+{
+    UPDATE_BUFFER = 0,
+    UPDATE_STRIP = 1,
+    RECIVE_DATA = 2,
+} timer_callback_type_t;
+static xQueueHandle timer_event_queue;
+void pov_timer_init(int rot_time, pov_driver_t *pov_driver);
+void pov_timer_start(void);
+bool update_buffer_callback();
+bool update_strip_callback();
+bool recive_data_callback();
+
+void app_main(void)
+{
+    wifi_init_station();
+    pov_driver_t pov_driver = pov_init();
+
+    // // 灯条刷新Timer
+
+    pov_timer_init(ROT_TIME, &pov_driver);
+    tcp_server_task_param_t tcp_param = {
+        .addr_family = AF_INET,
+        .pov_driver = &pov_driver,
+    };
+
+    xTaskCreate(tcp_server_task, "tcp_server", 4096, (void *)&tcp_param, 5, NULL);
+    pov_timer_start();
+    while (1)
+    {
+        timer_callback_type_t event;
+        xQueueReceive(timer_event_queue, &event, portMAX_DELAY);
+        switch (event)
+        {
+        case UPDATE_BUFFER:
+            // xTaskCreate(pov_update_buffer_task, "update_buffer", 4096, &pov_driver, 3, NULL);
+            pov_update_buffer_task(&pov_driver);
+            break;
+        case UPDATE_STRIP:
+            // xTaskCreate(pov_update_strip_task, "update_strip", 4096, &pov_driver, 3, NULL);
+            pov_update_strip_task(&pov_driver);
+            break;
+        case RECIVE_DATA:
+
+        default:
+            break;
+        }
+    }
+}
+
+
+static const char *TAG = "pov_timer";
+void pov_timer_init(int rot_time, pov_driver_t *pov_driver)
+{
+    timer_event_queue = xQueueCreate(2, sizeof(timer_callback_type_t));
+
+    timer_config_t rot_timer_config = {
+        .divider = 10,
+        .counter_dir = TIMER_COUNT_UP,
+        .counter_en = TIMER_PAUSE,
+        .alarm_en = TIMER_ALARM_DIS,
+        .auto_reload = TIMER_AUTORELOAD_EN,
+    };
+
+    ESP_LOGD(TAG, "POV Timer Init...");
+    ESP_ERROR_CHECK(timer_init(TIMER_GROUP_1, TIMER_0, &rot_timer_config));
+    ESP_ERROR_CHECK(timer_init(TIMER_GROUP_1, TIMER_1, &rot_timer_config));
+
+    ESP_ERROR_CHECK(timer_set_counter_value(TIMER_GROUP_1, TIMER_0, 0));
+    ESP_ERROR_CHECK(timer_set_counter_value(TIMER_GROUP_1, TIMER_1, 0));
+
+    // 给每转一圈注册中断
+    ESP_ERROR_CHECK(timer_set_alarm_value(TIMER_GROUP_1, TIMER_0, rot_time));
+    ESP_ERROR_CHECK(timer_enable_intr(TIMER_GROUP_1, TIMER_0));
+    ESP_ERROR_CHECK(timer_isr_callback_add(TIMER_GROUP_1, TIMER_0, (timer_isr_t)update_buffer_callback, (void *)NULL, 0));
+
+    // 给每次灯条刷新注册中断
+    ESP_LOGD(TAG, "registing strip update rate: %d", rot_time / pov_driver->pov_div);
+    ESP_ERROR_CHECK(timer_set_alarm_value(TIMER_GROUP_1, TIMER_1, rot_time / pov_driver->pov_div));
+    ESP_ERROR_CHECK(timer_enable_intr(TIMER_GROUP_1, TIMER_1));
+    ESP_ERROR_CHECK(timer_isr_callback_add(TIMER_GROUP_1, TIMER_1, (timer_isr_t)update_strip_callback, (void *)NULL, 0));
+}
+
+bool update_buffer_callback(void *any)
+{
+    timer_set_alarm(TIMER_GROUP_1, TIMER_0, TIMER_ALARM_EN);
+    BaseType_t high_task_awoken = pdFALSE;
+    timer_callback_type_t event = UPDATE_BUFFER;
+    xQueueSendToFrontFromISR(timer_event_queue, &event, &high_task_awoken);
+    return high_task_awoken == pdTRUE; // return whether we need to yield at the end of ISR
+}
+
+bool update_strip_callback(void *any)
+{
+    timer_set_alarm(TIMER_GROUP_1, TIMER_1, TIMER_ALARM_EN);
+    BaseType_t high_task_awoken = pdFALSE;
+    timer_callback_type_t event = UPDATE_STRIP;
+    xQueueSendToFrontFromISR(timer_event_queue, &event, &high_task_awoken);
+    return high_task_awoken == pdTRUE; // return whether we need to yield at the end of ISR
+}
+
+bool recive_data_callback(void *any)
+{
+    BaseType_t high_task_awoken = pdFALSE;
+    timer_callback_type_t event = RECIVE_DATA;
+    xQueueSendToFrontFromISR(timer_event_queue, &event, &high_task_awoken);
+    return high_task_awoken == pdTRUE; // return whether we need to yield at the end of ISR
+}
+
+void pov_timer_start(void)
+{
+    ESP_LOGD(TAG, "POV Timer start...");
+
+    ESP_ERROR_CHECK(timer_set_alarm(TIMER_GROUP_1, TIMER_0, TIMER_ALARM_EN));
+    ESP_ERROR_CHECK(timer_set_alarm(TIMER_GROUP_1, TIMER_1, TIMER_ALARM_EN));
+    ESP_ERROR_CHECK(timer_start(TIMER_GROUP_1, TIMER_0));
+    ESP_ERROR_CHECK(timer_start(TIMER_GROUP_1, TIMER_1));
+}
